@@ -1,14 +1,16 @@
-# DashlyClient
+DashlyClient
+[![Arduino listing](https://img.shields.io/github/v/release/Unical-A/DashlyClient?label=Library%20Manager&color=00979D)](https://www.arduino.cc/reference/en/libraries/dashlyclient/)
+Official Arduino library for DashlyIoT: connect ESP32 / ESP8266 to your dashboards.
 
-Official Arduino library for [DashlyIoT](https://dashlyiot.com): connect ESP32 / ESP8266 to your dashboards.
+🚀 Installation
+The easiest way is to use the Arduino Library Manager:
 
-## Install
+Open Arduino IDE.
 
-In **Arduino IDE**: *Sketch → Include Library → Add .ZIP Library…* (zip this folder), or clone into your `Arduino/libraries` folder.
+Go to Tools → Manage Libraries...
 
-## Layout
+Search for "DashlyClient".
 
-- `src/DashlyClient.h` — library header
-- `examples/` — ESP32 and ESP8266 sketches
+Click Install.
 
-See `library.properties` for metadata and supported architectures.
+Alternative: Clone this repo into your Arduino/libraries folder.
