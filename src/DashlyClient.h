@@ -1,5 +1,19 @@
 #pragma once
 
+/**
+ * DashlyClient — official ESP8266 / ESP32 transport for Dashly IoT.
+ *
+ * Versioning (semver):
+ *   - MAJOR: breaking API or default transport behavior changes
+ *   - MINOR: backward-compatible features (new setters, optional query params)
+ *   - PATCH: bug fixes only
+ *
+ * v2.1.0 (2026-05): Command-queue poll fallback for dashboard → device pin writes
+ *   when Realtime WebSocket broadcast is missed. Device virtualWrite uses queue=0
+ *   so telemetry/status does not echo back through the command queue.
+ */
+#define DASHLY_CLIENT_VERSION "2.1.0"
+
 #include <ArduinoJson.h>
 
 #if defined(ESP8266)
@@ -30,6 +44,7 @@ class DashlyClient {
 public:
   typedef void (*PinUpdateCallback)(String pin, String value);
   static constexpr const char* DEFAULT_BASE_URL = "https://dashlyiot.com";
+  static constexpr const char* LIBRARY_VERSION = DASHLY_CLIENT_VERSION;
 
   enum ConnectionMode { WIFI_MODE };
   enum TransportMode { AUTO_TRANSPORT, REALTIME_TRANSPORT, QUEUE_TRANSPORT, PIN_POLL_TRANSPORT };
@@ -42,11 +57,16 @@ public:
       _realtimeEnabled(false),
       _presenceOnlineSent(false),
       _restoreOnReconnect(false),
+      _commandPollEnabled(true),
       _presenceKey("device"),
       _presenceIntervalMs(30000),
       _lastPresenceMs(0),
       _lastPollMs(0),
-      _pollIntervalMs(1500),
+      _pollIntervalMs(900),
+      _commandPollIntervalMs(1200),
+      _lastCommandPollMs(0),
+      _lastCommandId(0),
+      _lastDispatchMs(0),
       _fallbackPin("v1"),
       _lastFallbackValue(""),
       _fallbackDisabledByPolicy(false),
@@ -56,10 +76,16 @@ public:
   /** Last HTTP status from the gateway (-1 = connect/begin failed). */
   int lastHttpCode() const { return _lastHttpCode; }
 
+  static const char* libraryVersion() { return LIBRARY_VERSION; }
+
   void setConnectionMode(ConnectionMode mode) { (void)mode; }
   void onWrite(PinUpdateCallback callback) { _callback = callback; }
   void setTransportMode(TransportMode mode) { _transportMode = mode; }
   void setQueuePollIntervalMs(unsigned long intervalMs) { _pollIntervalMs = intervalMs < 500 ? 500 : intervalMs; }
+  /** Poll interval for dashboard command queue (default 1200 ms). Minimum 500 ms. */
+  void setCommandPollIntervalMs(unsigned long intervalMs) { _commandPollIntervalMs = intervalMs < 500 ? 500 : intervalMs; }
+  /** Enable/disable HTTP command-queue polling (default on). Disable only if you rely solely on WS. */
+  void setCommandPollEnabled(bool enabled) { _commandPollEnabled = enabled; }
   void setQueueFallbackPin(const char* pin) { if (pin && *pin) _fallbackPin = String(pin); }
 
   bool networkReady() { return isNetworkReady(); }
@@ -113,7 +139,7 @@ public:
     }
 
     unsigned long now = millis();
-    // Re-establish online heartbeat after reconnect (especially important for ESP8266 pin-poll mode).
+    if (_presenceOnlineSent && _commandPollEnabled) pollDeviceCommands(now);
     if (!_presenceOnlineSent) {
       if (sendPresence(true)) {
         _presenceOnlineSent = true;
@@ -136,13 +162,18 @@ public:
   bool virtualWrite(const char* pin, const String& value) {
     if (!isNetworkReady()) return false;
     String body;
-    int code = doGet((normalizeBase(_baseUrl) + "/api/update?pin=" + String(pin) + "&value=" + value).c_str(), body);
+    // queue=0: device telemetry/status must not re-enter the dashboard command queue.
+    String url = normalizeBase(_baseUrl) + "/api/update?pin=" + urlEncode(String(pin)) + "&value=" +
+                 urlEncode(value) + "&queue=0";
+    int code = doGet(url.c_str(), body);
     return code == 200;
   }
   bool virtualWrite(const char* pin, int value) { return virtualWrite(pin, String(value)); }
   bool virtualWrite(const char* pin, float value) { return virtualWrite(pin, String(value, 2)); }
 
 private:
+  static constexpr unsigned long PIN_DISPATCH_DEDUPE_MS = 400;
+
   const char* _token;
   const char* _baseUrl;
   PinUpdateCallback _callback;
@@ -150,10 +181,15 @@ private:
   bool _realtimeEnabled;
   bool _presenceOnlineSent;
   bool _restoreOnReconnect;
+  bool _commandPollEnabled;
 
   String _projectId, _sbUrl, _sbAnon, _topic, _presenceKey;
   String _wsHost, _wsPath;
-  unsigned long _presenceIntervalMs, _lastPresenceMs, _lastPollMs, _pollIntervalMs, _ref;
+  String _lastDispatchPin, _lastDispatchValue;
+  unsigned long _presenceIntervalMs, _lastPresenceMs, _lastPollMs, _pollIntervalMs;
+  unsigned long _commandPollIntervalMs, _lastCommandPollMs, _lastDispatchMs;
+  uint32_t _lastCommandId;
+  unsigned long _ref;
   String _fallbackPin, _lastFallbackValue;
   bool _fallbackDisabledByPolicy;
   int _lastHttpCode;
@@ -170,13 +206,22 @@ private:
 #endif
   }
 
+  void dispatchPinUpdate(const String& pin, const String& value) {
+    if (!_callback || pin.length() == 0) return;
+    unsigned long now = millis();
+    if (pin == _lastDispatchPin && value == _lastDispatchValue && (now - _lastDispatchMs) < PIN_DISPATCH_DEDUPE_MS) {
+      return;
+    }
+    _lastDispatchPin = pin;
+    _lastDispatchValue = value;
+    _lastDispatchMs = now;
+    _callback(pin, value);
+  }
+
   bool beginRealtime(const String& projectId, const String& sbUrl, const String& sbAnon) {
     _projectId = projectId;
     _sbUrl = sbUrl;
     _sbAnon = sbAnon;
-    // Must match the browser channel name (`project:<uuid>`). Anon JWT cannot subscribe to
-    // postgres_changes on `pins` (RLS), so joinTopic() must not request postgres_changes — only
-    // broadcast (same as dashboard's base channel config before .on(postgres_changes)).
     _topic = "project:" + _projectId;
     _realtimeEnabled = false;
 #if !DASHLY_HAS_REALTIME
@@ -209,9 +254,11 @@ private:
     JsonObject cfg = doc["payload"]["config"].to<JsonObject>();
     cfg["broadcast"]["self"] = true;
     cfg["presence"]["key"] = _presenceKey;
-    cfg["postgres_changes"].to<JsonArray>(); // empty — anon cannot use pins replication (RLS)
+    cfg["postgres_changes"].to<JsonArray>();
 
-    String out; serializeJson(doc, out); _ws.sendTXT(out);
+    String out;
+    serializeJson(doc, out);
+    _ws.sendTXT(out);
 #endif
   }
 
@@ -225,14 +272,19 @@ private:
     doc["payload"]["type"] = "device";
     doc["payload"]["user_type"] = "device";
     doc["payload"]["source"] = "arduino";
-    String out; serializeJson(doc, out); _ws.sendTXT(out);
+    String out;
+    serializeJson(doc, out);
+    _ws.sendTXT(out);
 #endif
   }
 
   void handleWs(WStype_t type, uint8_t* payload, size_t length) {
 #if DASHLY_HAS_REALTIME
     (void)length;
-    if (type == WStype_CONNECTED) { joinTopic(); return; }
+    if (type == WStype_CONNECTED) {
+      joinTopic();
+      return;
+    }
     if (type == WStype_DISCONNECTED || type == WStype_ERROR) {
       sendPresence(false);
       _presenceOnlineSent = false;
@@ -258,25 +310,31 @@ private:
       return;
     }
 
-    if (event == "broadcast" && _callback) {
+    if (event == "broadcast") {
       String sub = doc["payload"]["event"] | "";
       if (sub == "pin_update") {
         String pin = doc["payload"]["payload"]["pin"] | "";
         String value = doc["payload"]["payload"]["value"] | "";
-        if (pin.length() > 0) _callback(pin, value);
+        if (pin.length() == 0) {
+          pin = doc["payload"]["pin"] | "";
+          value = doc["payload"]["value"] | "";
+        }
+        dispatchPinUpdate(pin, value);
       }
       return;
     }
 
-    if (event == "postgres_changes" && _callback) {
+    if (event == "postgres_changes") {
       String pin = doc["payload"]["data"]["new"]["pin_label"] | "";
       String value = doc["payload"]["data"]["new"]["value"] | "";
       if (pin.length() == 0) pin = doc["payload"]["data"]["record"]["pin_label"] | "";
       if (value.length() == 0) value = doc["payload"]["data"]["record"]["value"] | "";
-      if (pin.length() > 0) _callback(pin, value);
+      dispatchPinUpdate(pin, value);
     }
 #else
-    (void)type; (void)payload; (void)length;
+    (void)type;
+    (void)payload;
+    (void)length;
 #endif
   }
 
@@ -291,13 +349,55 @@ private:
     if (_fallbackDisabledByPolicy || _fallbackPin.length() == 0) return;
     String body;
     int code = doGet((normalizeBase(_baseUrl) + "/api/pins?pin=" + _fallbackPin + "&live=1").c_str(), body);
-    if (code == 403) { _fallbackDisabledByPolicy = true; return; }
+    if (code == 403) {
+      _fallbackDisabledByPolicy = true;
+      return;
+    }
     if (code != 200 || body.length() == 0) return;
-    if (_lastFallbackValue.length() == 0) { _lastFallbackValue = body; return; }
+    if (_lastFallbackValue.length() == 0) {
+      _lastFallbackValue = body;
+      return;
+    }
     if (body != _lastFallbackValue) {
       _lastFallbackValue = body;
-      if (_callback) _callback(_fallbackPin, body);
+      dispatchPinUpdate(_fallbackPin, body);
     }
+  }
+
+  /**
+   * Poll pending dashboard/automation commands (GET /api/device/commands).
+   * Requires gateway >= 2026-05 with pending=1 and queue=0 support on /api/update.
+   */
+  void pollDeviceCommands(unsigned long now) {
+    if (now - _lastCommandPollMs < _commandPollIntervalMs) return;
+    _lastCommandPollMs = now;
+
+    String body;
+    String url = normalizeBase(_baseUrl) + "/api/device/commands?pending=1&limit=5";
+    int code = doGet(url.c_str(), body);
+    if (code != 200 || body.length() == 0) return;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) return;
+    JsonArray arr = doc["commands"].as<JsonArray>();
+    if (arr.isNull() || arr.size() == 0) return;
+
+    for (JsonObject cmd : arr) {
+      uint32_t id = cmd["id"] | 0;
+      String pin = cmd["pin_label"] | "";
+      String value = cmd["value"] | "";
+      if (id == 0 || pin.length() == 0) continue;
+      if (id > _lastCommandId) _lastCommandId = id;
+      dispatchPinUpdate(pin, value);
+      ackDeviceCommand(id);
+    }
+  }
+
+  bool ackDeviceCommand(uint32_t id) {
+    String payload = String("{\"id\":") + String(id) + "}";
+    String resp;
+    String url = normalizeBase(_baseUrl) + "/api/device/ack";
+    return httpRequest("POST", url.c_str(), payload.c_str(), resp) == 200;
   }
 
   bool sendPresence(bool online) {
@@ -312,7 +412,9 @@ private:
   int httpRequest(const char* method, const char* fullUrl, const char* payload, String& outBody) {
     outBody = "";
 #if !DASHLY_HAS_HTTPS
-    (void)method; (void)fullUrl; (void)payload;
+    (void)method;
+    (void)fullUrl;
+    (void)payload;
     _lastHttpCode = -1;
     return -1;
 #else
@@ -364,5 +466,25 @@ private:
     String s = String(in ? in : DEFAULT_BASE_URL);
     if (s.endsWith("/")) s.remove(s.length() - 1, 1);
     return s;
+  }
+
+  static String urlEncode(const String& in) {
+    String out;
+    out.reserve(in.length() + 8);
+    const char* hex = "0123456789ABCDEF";
+    for (size_t i = 0; i < in.length(); ++i) {
+      const char c = in[i];
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+          c == '.' || c == '~') {
+        out += c;
+      } else if (c == ' ') {
+        out += '+';
+      } else {
+        out += '%';
+        out += hex[(c >> 4) & 0xF];
+        out += hex[c & 0xF];
+      }
+    }
+    return out;
   }
 };
