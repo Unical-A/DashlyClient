@@ -1,7 +1,7 @@
 #include <ESP8266WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include "DashlyClient.h"
+#include <DashlyClient.h>
 
 // WiFi and Dashly credentials — set these before upload (Dashboard → device token).
 const char* ssid = "YOUR_WIFI_SSID";
