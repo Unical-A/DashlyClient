@@ -1,7 +1,7 @@
 #include <WiFi.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <DashlyClient.h>
+#include "DashlyClient.h"
 
 // WiFi and Dashly credentials — set these before upload (Dashboard → device token).
 const char* ssid = "YOUR_WIFI_SSID";
@@ -17,7 +17,7 @@ const int ds18b20Pin = 4; // Change if your sensor data pin is different
 OneWire oneWire(ds18b20Pin);
 DallasTemperature sensors(&oneWire);
 unsigned long lastTempPublishMs = 0;
-const unsigned long tempPublishIntervalMs = 5000;
+const unsigned long tempPublishIntervalMs = 10000;
 unsigned long lastRecoverAttemptMs = 0;
 unsigned long firstHttpFailMs = 0;
 int consecutiveHttpFailCount = 0;
@@ -123,6 +123,8 @@ void setup() {
     Serial.print(".");
   }
   Serial.println("\nWiFi Connected!");
+  Serial.print("DashlyClient ");
+  Serial.println(DashlyClient::libraryVersion());
 
   dashly.setConnectionMode(DashlyClient::WIFI_MODE);
   dashly.setTransportMode(DashlyClient::AUTO_TRANSPORT);
