@@ -8,11 +8,11 @@
  *   - MINOR: backward-compatible features (new setters, optional query params)
  *   - PATCH: bug fixes only
  *
- * v2.1.0 (2026-05): Command-queue poll fallback for dashboard → device pin writes
+ * v2.1.1 (2026-05): Command-queue poll fallback for dashboard → device pin writes
  *   when Realtime WebSocket broadcast is missed. Device virtualWrite uses queue=0
  *   so telemetry/status does not echo back through the command queue.
  */
-#define DASHLY_CLIENT_VERSION "2.1.0"
+#define DASHLY_CLIENT_VERSION "2.1.1"
 
 #include <ArduinoJson.h>
 
@@ -77,6 +77,31 @@ public:
   int lastHttpCode() const { return _lastHttpCode; }
 
   static const char* libraryVersion() { return LIBRARY_VERSION; }
+
+  /**
+   * Parse `#RRGGBB`, `RRGGBB`, or `#RGB` for WS2812B / dashboard pin values.
+   * Returns false for off/empty/invalid (use before treating value as a color).
+   */
+  static bool parseHexColor(const String& in, uint8_t& r, uint8_t& g, uint8_t& b) {
+    String s = in;
+    s.trim();
+    if (s.length() == 0 || s == "0") return false;
+    if (s.startsWith("%23")) s = s.substring(3);
+    while (s.startsWith("#")) s = s.substring(1);
+    if (s.length() == 3) {
+      s = String(s[0]) + String(s[0]) + String(s[1]) + String(s[1]) + String(s[2]) + String(s[2]);
+    }
+    if (s.length() != 6) return false;
+    char buf[8];
+    s.toCharArray(buf, sizeof(buf));
+    char* end = nullptr;
+    unsigned long n = strtoul(buf, &end, 16);
+    if (end == nullptr || *end != '\0') return false;
+    r = static_cast<uint8_t>((n >> 16) & 0xFF);
+    g = static_cast<uint8_t>((n >> 8) & 0xFF);
+    b = static_cast<uint8_t>(n & 0xFF);
+    return true;
+  }
 
   void setConnectionMode(ConnectionMode mode) { (void)mode; }
   void onWrite(PinUpdateCallback callback) { _callback = callback; }
