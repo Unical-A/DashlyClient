@@ -8,13 +8,26 @@
  *   - MINOR: backward-compatible features (new setters, optional query params)
  *   - PATCH: bug fixes only
  *
+ * v2.1.2: Realtime stability fixes
+ *   - Send Phoenix heartbeat every 20 s so the Realtime server keeps the socket open
+ *   - WebSocket disconnect no longer runs a blocking HTTPS presence call and no longer
+ *     stops the command-queue poll while the socket reconnects
+ *   - WebSocket reconnect interval 3000 ms -> 1000 ms
+ *   - Optional debug logging: define DASHLY_DEBUG before including this header
+ *
  * v2.1.1 (2026-05): Command-queue poll fallback for dashboard → device pin writes
  *   when Realtime WebSocket broadcast is missed. Device virtualWrite uses queue=0
  *   so telemetry/status does not echo back through the command queue.
  */
-#define DASHLY_CLIENT_VERSION "2.1.1"
+#define DASHLY_CLIENT_VERSION "2.1.2"
 
 #include <ArduinoJson.h>
+
+#ifdef DASHLY_DEBUG
+#define DASHLY_LOG(msg) Serial.println(F(msg))
+#else
+#define DASHLY_LOG(msg) ((void)0)
+#endif
 
 #if defined(ESP8266)
 #include <ESP8266WiFi.h>
@@ -71,6 +84,7 @@ public:
       _lastFallbackValue(""),
       _fallbackDisabledByPolicy(false),
       _lastHttpCode(0),
+      _lastHeartbeatMs(0),
       _ref(1) {}
 
   /** Last HTTP status from the gateway (-1 = connect/begin failed). */
@@ -158,6 +172,11 @@ public:
     if (_realtimeEnabled) {
 #if DASHLY_HAS_REALTIME
       _ws.loop();
+      unsigned long hb = millis();
+      if (hb - _lastHeartbeatMs >= 20000) {
+        _lastHeartbeatMs = hb;
+        sendPhoenixHeartbeat();
+      }
 #endif
     } else {
       runHttpFallback();
@@ -218,6 +237,7 @@ private:
   String _fallbackPin, _lastFallbackValue;
   bool _fallbackDisabledByPolicy;
   int _lastHttpCode;
+  unsigned long _lastHeartbeatMs;
 
 #if DASHLY_HAS_REALTIME
   WebSocketsClient _ws;
@@ -243,6 +263,14 @@ private:
     _callback(pin, value);
   }
 
+  void sendPhoenixHeartbeat() {
+#if DASHLY_HAS_REALTIME
+    String out = String("{\"topic\":\"phoenix\",\"event\":\"heartbeat\",\"payload\":{},\"ref\":\"") +
+                 String(_ref++) + "\"}";
+    _ws.sendTXT(out);
+#endif
+  }
+
   bool beginRealtime(const String& projectId, const String& sbUrl, const String& sbAnon) {
     _projectId = projectId;
     _sbUrl = sbUrl;
@@ -263,7 +291,7 @@ private:
     _ws.beginSSL(_wsHost.c_str(), 443, _wsPath.c_str());
     _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) { this->handleWs(type, payload, length); });
     _ws.enableHeartbeat(30000, 5000, 2);
-    _ws.setReconnectInterval(3000);
+    _ws.setReconnectInterval(1000);
     _realtimeEnabled = true;
     return true;
 #endif
@@ -307,12 +335,12 @@ private:
 #if DASHLY_HAS_REALTIME
     (void)length;
     if (type == WStype_CONNECTED) {
+      DASHLY_LOG(">>> WS connected");
       joinTopic();
       return;
     }
     if (type == WStype_DISCONNECTED || type == WStype_ERROR) {
-      sendPresence(false);
-      _presenceOnlineSent = false;
+      DASHLY_LOG(">>> WS disconnected");
       return;
     }
     if (type != WStype_TEXT) return;
