@@ -8,20 +8,35 @@
  *   - MINOR: backward-compatible features (new setters, optional query params)
  *   - PATCH: bug fixes only
  *
- * v2.1.2: Realtime stability fixes
- *   - Send Phoenix heartbeat every 20 s so the Realtime server keeps the socket open
- *   - WebSocket disconnect no longer runs a blocking HTTPS presence call and no longer
- *     stops the command-queue poll while the socket reconnects
- *   - WebSocket reconnect interval 3000 ms -> 1000 ms
- *   - Optional debug logging: define DASHLY_DEBUG before including this header
+ * v2.2.0: Fast, non-blocking transport (ESP32)
+ *   - All network I/O runs in background FreeRTOS tasks. loop() never waits for the
+ *     network: virtualWrite() only queues the value, run() only delivers received
+ *     commands to the onWrite() callback (called from the task that calls run()).
+ *   - The Realtime WebSocket has its own task, so commands are received instantly,
+ *     even while telemetry is being uploaded.
+ *   - HTTPS connection is kept alive and reused (no new TLS handshake per request).
+ *   - Commands that were already delivered over WebSocket are NOT executed a second
+ *     time when the command-queue poll returns them (they are only acknowledged).
+ *   - Command backlog that is still pending when the device boots is discarded
+ *     (acknowledged without executing), so old commands never replay after a reboot.
+ *   - Command-queue poll is only a safety net: default interval 10 s, and an extra
+ *     poll runs right after every WebSocket (re)connect.
+ *   - Phoenix heartbeat every 20 s; reconnect interval 1 s.
+ *   - beginRealtimeAuto() is non-blocking: it starts the tasks and returns true; the
+ *     bootstrap is retried in the background until it succeeds.
+ *   - ESP8266 keeps working in the old cooperative mode (everything runs inside run()).
+ *   - Optional debug logging: define DASHLY_DEBUG before including this header.
+ *
+ * v2.1.2: Realtime stability fixes (Phoenix heartbeat, non-blocking disconnect).
  *
  * v2.1.1 (2026-05): Command-queue poll fallback for dashboard → device pin writes
  *   when Realtime WebSocket broadcast is missed. Device virtualWrite uses queue=0
  *   so telemetry/status does not echo back through the command queue.
  */
-#define DASHLY_CLIENT_VERSION "2.1.2"
+#define DASHLY_CLIENT_VERSION "2.2.0"
 
 #include <ArduinoJson.h>
+#include <string.h>
 
 #ifdef DASHLY_DEBUG
 #define DASHLY_LOG(msg) Serial.println(F(msg))
@@ -35,14 +50,20 @@
 #include <WiFiClientSecureBearSSL.h>
 typedef BearSSL::WiFiClientSecure DashlySecureClient;
 #define DASHLY_HAS_HTTPS 1
+#define DASHLY_USE_TASKS 0
 #elif defined(ESP32)
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 typedef WiFiClientSecure DashlySecureClient;
 #define DASHLY_HAS_HTTPS 1
+#define DASHLY_USE_TASKS 1
 #else
 #define DASHLY_HAS_HTTPS 0
+#define DASHLY_USE_TASKS 0
 #endif
 
 #if __has_include(<WebSocketsClient.h>)
@@ -52,6 +73,22 @@ typedef WiFiClientSecure DashlySecureClient;
 #define DASHLY_HAS_REALTIME 0
 typedef int WStype_t;
 #endif
+
+#if DASHLY_USE_TASKS
+typedef SemaphoreHandle_t DashlyMutex;
+#define DASHLY_TAKE(m) do { if (m) xSemaphoreTake((m), portMAX_DELAY); } while (0)
+#define DASHLY_GIVE(m) do { if (m) xSemaphoreGive((m)); } while (0)
+#else
+typedef int DashlyMutex;
+#define DASHLY_TAKE(m) ((void)0)
+#define DASHLY_GIVE(m) ((void)0)
+#endif
+
+static inline void dashlyCopy(char* dst, const char* src, size_t n) {
+  if (!src) src = "";
+  strncpy(dst, src, n - 1);
+  dst[n - 1] = '\0';
+}
 
 class DashlyClient {
 public:
@@ -63,32 +100,13 @@ public:
   enum TransportMode { AUTO_TRANSPORT, REALTIME_TRANSPORT, QUEUE_TRANSPORT, PIN_POLL_TRANSPORT };
 
   DashlyClient(const char* token, const char* appBaseUrl = DEFAULT_BASE_URL)
-    : _token(token),
-      _baseUrl(appBaseUrl),
-      _callback(nullptr),
-      _transportMode(AUTO_TRANSPORT),
-      _realtimeEnabled(false),
-      _presenceOnlineSent(false),
-      _restoreOnReconnect(false),
-      _commandPollEnabled(true),
-      _presenceKey("device"),
-      _presenceIntervalMs(30000),
-      _lastPresenceMs(0),
-      _lastPollMs(0),
-      _pollIntervalMs(900),
-      _commandPollIntervalMs(1200),
-      _lastCommandPollMs(0),
-      _lastCommandId(0),
-      _lastDispatchMs(0),
-      _fallbackPin("v1"),
-      _lastFallbackValue(""),
-      _fallbackDisabledByPolicy(false),
-      _lastHttpCode(0),
-      _lastHeartbeatMs(0),
-      _ref(1) {}
+    : _token(token), _baseUrl(appBaseUrl) {}
 
   /** Last HTTP status from the gateway (-1 = connect/begin failed). */
   int lastHttpCode() const { return _lastHttpCode; }
+
+  /** True while the Realtime WebSocket is connected. */
+  bool isConnected() const { return _wsConnected; }
 
   static const char* libraryVersion() { return LIBRARY_VERSION; }
 
@@ -121,7 +139,7 @@ public:
   void onWrite(PinUpdateCallback callback) { _callback = callback; }
   void setTransportMode(TransportMode mode) { _transportMode = mode; }
   void setQueuePollIntervalMs(unsigned long intervalMs) { _pollIntervalMs = intervalMs < 500 ? 500 : intervalMs; }
-  /** Poll interval for dashboard command queue (default 1200 ms). Minimum 500 ms. */
+  /** Safety-net poll interval for the dashboard command queue (default 10000 ms). Minimum 500 ms. */
   void setCommandPollIntervalMs(unsigned long intervalMs) { _commandPollIntervalMs = intervalMs < 500 ? 500 : intervalMs; }
   /** Enable/disable HTTP command-queue polling (default on). Disable only if you rely solely on WS. */
   void setCommandPollEnabled(bool enabled) { _commandPollEnabled = enabled; }
@@ -130,72 +148,43 @@ public:
   bool networkReady() { return isNetworkReady(); }
   bool shouldRestoreOnReconnect() const { return _restoreOnReconnect; }
 
+  /**
+   * Starts the background transport. Non-blocking: returns true right away; the
+   * bootstrap/WebSocket connection is established (and retried) in the background.
+   */
   bool beginRealtimeAuto(const char* presenceKey = "device") {
-    if (!isNetworkReady()) return false;
 #if !DASHLY_HAS_HTTPS
     return false;
 #else
-    String body;
-    int code = doGet((normalizeBase(_baseUrl) + "/api/bootstrap").c_str(), body);
-    if (code != 200 || body.length() == 0) return false;
-
-    JsonDocument doc;
-    if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
-
-    String projectId = doc["project_id"] | "";
-    String sbUrl = doc["supabase_url"] | "";
-    String sbAnon = doc["supabase_anon_key"] | "";
-    _restoreOnReconnect = doc["restore_on_reconnect"] | false;
-    if (projectId.length() == 0 || sbUrl.length() == 0 || sbAnon.length() == 0) return false;
-
-    _presenceKey = String(presenceKey);
-    bool wantRealtime = (_transportMode == AUTO_TRANSPORT || _transportMode == REALTIME_TRANSPORT);
-    if (wantRealtime && beginRealtime(projectId, sbUrl, sbAnon)) return true;
-    if (_transportMode == REALTIME_TRANSPORT) return false;
-
-    _realtimeEnabled = false;
-    unsigned long now = millis();
-    if (sendPresence(true)) {
-      _presenceOnlineSent = true;
-      _lastPresenceMs = now;
+    if (_started) return true;
+    _presenceKey = String(presenceKey ? presenceKey : "device");
+#if DASHLY_USE_TASKS
+    _qLock = xSemaphoreCreateMutex();
+    _httpLock = xSemaphoreCreateMutex();
+    _started = true;
+    BaseType_t a = xTaskCreate(wsTaskEntry, "dashly_ws", 10240, this, 2, &_wsTask);
+    BaseType_t b = xTaskCreate(httpTaskEntry, "dashly_http", 10240, this, 1, &_httpTask);
+    if (a != pdPASS || b != pdPASS) {
+      DASHLY_LOG(">>> Dashly: task start failed");
+      return false;
     }
+#else
+    _started = true;
+#endif
     return true;
 #endif
   }
 
+  /** Call from loop(). Delivers received commands to the onWrite() callback. Never blocks on the network (ESP32). */
   void run() {
-    if (!isNetworkReady()) {
-      _presenceOnlineSent = false;
-      return;
-    }
-
-    if (_realtimeEnabled) {
-#if DASHLY_HAS_REALTIME
-      _ws.loop();
-      unsigned long hb = millis();
-      if (hb - _lastHeartbeatMs >= 20000) {
-        _lastHeartbeatMs = hb;
-        sendPhoenixHeartbeat();
-      }
+    if (!_started) beginRealtimeAuto(_presenceKey.c_str());
+#if !DASHLY_USE_TASKS
+    netStep();  // ESP8266: cooperative mode
 #endif
-    } else {
-      runHttpFallback();
-    }
-
-    unsigned long now = millis();
-    if (_presenceOnlineSent && _commandPollEnabled) pollDeviceCommands(now);
-    if (!_presenceOnlineSent) {
-      if (sendPresence(true)) {
-        _presenceOnlineSent = true;
-        _lastPresenceMs = now;
-      }
-      return;
-    }
-    if (_presenceOnlineSent && (now - _lastPresenceMs >= _presenceIntervalMs)) {
-      if (sendPresence(true)) _lastPresenceMs = now;
-    }
+    dispatchIncoming();
   }
 
+  /** Synchronous read (blocks until the server answers). Avoid in time-critical code. */
   String virtualRead(const char* pin) {
     if (!isNetworkReady()) return "";
     String body;
@@ -203,45 +192,147 @@ public:
     return code == 200 ? body : "";
   }
 
+  /** Queues the value for sending and returns immediately (ESP32). Latest value per pin wins. */
   bool virtualWrite(const char* pin, const String& value) {
-    if (!isNetworkReady()) return false;
-    String body;
-    // queue=0: device telemetry/status must not re-enter the dashboard command queue.
-    String url = normalizeBase(_baseUrl) + "/api/update?pin=" + urlEncode(String(pin)) + "&value=" +
-                 urlEncode(value) + "&queue=0";
-    int code = doGet(url.c_str(), body);
-    return code == 200;
+    if (!pin || !*pin) return false;
+    if (!_started) return sendUpdate(pin, value.c_str());  // legacy use without begin: send synchronously
+    DASHLY_TAKE(_qLock);
+    bool ok = _out.push(pin, value.c_str(), true);
+    DASHLY_GIVE(_qLock);
+    return ok;
   }
   bool virtualWrite(const char* pin, int value) { return virtualWrite(pin, String(value)); }
   bool virtualWrite(const char* pin, float value) { return virtualWrite(pin, String(value, 2)); }
 
 private:
-  static constexpr unsigned long PIN_DISPATCH_DEDUPE_MS = 400;
+  static constexpr unsigned long WS_DEDUPE_MS = 400;
+  static constexpr unsigned long SEEN_TTL_MS = 600000UL;  // WS-delivered commands are remembered for 10 min
+
+  // ---------- small fixed-size message queue ----------
+  struct Msg {
+    char pin[16];
+    char value[48];
+  };
+  struct MsgQueue {
+    static const uint8_t CAP = 16;
+    Msg items[CAP];
+    uint8_t head = 0;
+    uint8_t count = 0;
+    bool push(const char* pin, const char* value, bool coalesce) {
+      if (coalesce) {
+        char p[16];
+        dashlyCopy(p, pin, sizeof(p));
+        for (uint8_t i = 0; i < count; i++) {
+          Msg& m = items[(head + i) % CAP];
+          if (strcmp(m.pin, p) == 0) {
+            dashlyCopy(m.value, value, sizeof(m.value));
+            return true;
+          }
+        }
+      }
+      if (count >= CAP) return false;
+      Msg& m = items[(head + count) % CAP];
+      dashlyCopy(m.pin, pin, sizeof(m.pin));
+      dashlyCopy(m.value, value, sizeof(m.value));
+      count++;
+      return true;
+    }
+    bool pop(Msg& out) {
+      if (count == 0) return false;
+      out = items[head];
+      head = (head + 1) % CAP;
+      count--;
+      return true;
+    }
+  };
+
+  struct Seen {
+    char pin[16];
+    char value[48];
+    unsigned long at;
+    bool used;
+  };
 
   const char* _token;
   const char* _baseUrl;
-  PinUpdateCallback _callback;
-  TransportMode _transportMode;
-  bool _realtimeEnabled;
-  bool _presenceOnlineSent;
-  bool _restoreOnReconnect;
-  bool _commandPollEnabled;
+  PinUpdateCallback _callback = nullptr;
+  TransportMode _transportMode = AUTO_TRANSPORT;
 
-  String _projectId, _sbUrl, _sbAnon, _topic, _presenceKey;
+  volatile bool _started = false;
+  volatile bool _bootstrapped = false;
+  volatile bool _realtimeMode = false;
+  volatile bool _wsConnected = false;
+  volatile bool _wsJoined = false;
+  volatile bool _pollNow = false;
+  volatile bool _needPresence = false;
+  bool _wsBegun = false;
+  bool _restoreOnReconnect = false;
+  bool _commandPollEnabled = true;
+  bool _presenceOnlineSent = false;
+  bool _syncDone = false;  // false until the boot-time command backlog has been discarded
+  bool _lastPollOk = true;
+
+  String _projectId, _sbUrl, _sbAnon, _topic, _presenceKey = "device";
   String _wsHost, _wsPath;
-  String _lastDispatchPin, _lastDispatchValue;
-  unsigned long _presenceIntervalMs, _lastPresenceMs, _lastPollMs, _pollIntervalMs;
-  unsigned long _commandPollIntervalMs, _lastCommandPollMs, _lastDispatchMs;
-  uint32_t _lastCommandId;
-  unsigned long _ref;
-  String _fallbackPin, _lastFallbackValue;
-  bool _fallbackDisabledByPolicy;
-  int _lastHttpCode;
-  unsigned long _lastHeartbeatMs;
+  unsigned long _presenceIntervalMs = 30000, _lastPresenceMs = 0, _presenceRetryAt = 0;
+  unsigned long _pollIntervalMs = 900, _lastPollMs = 0;
+  unsigned long _commandPollIntervalMs = 10000, _lastCommandPollMs = 0;
+  unsigned long _lastBootstrapTry = 0, _sendRetryAt = 0, _lastHeartbeatMs = 0;
+  uint32_t _lastCommandId = 0;
+  unsigned long _ref = 1;
+  String _fallbackPin = "v1", _lastFallbackValue;
+  bool _fallbackDisabledByPolicy = false;
+  volatile int _lastHttpCode = 0;
+
+  MsgQueue _out;
+  MsgQueue _in;
+  Seen _seen[32] = {};
+  uint8_t _seenNext = 0;
+  char _lastWsPin[16] = "";
+  char _lastWsValue[48] = "";
+  unsigned long _lastWsAt = 0;
+
+  DashlyMutex _qLock = 0;
+  DashlyMutex _httpLock = 0;
+
+#if DASHLY_USE_TASKS
+  TaskHandle_t _wsTask = nullptr;
+  TaskHandle_t _httpTask = nullptr;
+  DashlySecureClient _secure;
+  HTTPClient _http;
+  bool _secureInit = false;
+#endif
 
 #if DASHLY_HAS_REALTIME
   WebSocketsClient _ws;
 #endif
+
+  // ---------- tasks ----------
+#if DASHLY_USE_TASKS
+  static TickType_t msToTicks(uint32_t ms) {
+    TickType_t t = pdMS_TO_TICKS(ms);
+    return t ? t : 1;
+  }
+  static void wsTaskEntry(void* p) {
+    DashlyClient* self = static_cast<DashlyClient*>(p);
+    for (;;) {
+      self->wsStep();
+      vTaskDelay(msToTicks(5));
+    }
+  }
+  static void httpTaskEntry(void* p) {
+    DashlyClient* self = static_cast<DashlyClient*>(p);
+    for (;;) {
+      self->httpStep();
+      vTaskDelay(msToTicks(20));
+    }
+  }
+#endif
+
+  void netStep() {
+    httpStep();
+    wsStep();
+  }
 
   bool isNetworkReady() {
 #if defined(ESP8266) || defined(ESP32)
@@ -251,49 +342,74 @@ private:
 #endif
   }
 
-  void dispatchPinUpdate(const String& pin, const String& value) {
-    if (!_callback || pin.length() == 0) return;
-    unsigned long now = millis();
-    if (pin == _lastDispatchPin && value == _lastDispatchValue && (now - _lastDispatchMs) < PIN_DISPATCH_DEDUPE_MS) {
-      return;
+  // ---------- delivering commands to the sketch ----------
+  void dispatchIncoming() {
+    for (uint8_t n = 0; n < 8; n++) {
+      Msg m;
+      DASHLY_TAKE(_qLock);
+      bool ok = _in.pop(m);
+      DASHLY_GIVE(_qLock);
+      if (!ok) break;
+      if (_callback) _callback(String(m.pin), String(m.value));
     }
-    _lastDispatchPin = pin;
-    _lastDispatchValue = value;
-    _lastDispatchMs = now;
-    _callback(pin, value);
   }
 
+  // Command that arrived over the WebSocket: remember it, then queue it for the sketch.
+  void acceptWsCommand(const String& pin, const String& value) {
+    if (pin.length() == 0) return;
+    unsigned long now = millis();
+    DASHLY_TAKE(_qLock);
+    bool dup = (strcmp(_lastWsPin, pin.c_str()) == 0 && strcmp(_lastWsValue, value.c_str()) == 0 &&
+                (now - _lastWsAt) < WS_DEDUPE_MS);
+    if (!dup) {
+      dashlyCopy(_lastWsPin, pin.c_str(), sizeof(_lastWsPin));
+      dashlyCopy(_lastWsValue, value.c_str(), sizeof(_lastWsValue));
+      _lastWsAt = now;
+      Seen& s = _seen[_seenNext];
+      _seenNext = (_seenNext + 1) % 32;
+      dashlyCopy(s.pin, pin.c_str(), sizeof(s.pin));
+      dashlyCopy(s.value, value.c_str(), sizeof(s.value));
+      s.at = now;
+      s.used = true;
+      _in.push(pin.c_str(), value.c_str(), false);
+    }
+    DASHLY_GIVE(_qLock);
+  }
+
+  // True (and forgets the entry) if this command was already delivered over the WebSocket.
+  bool consumeSeen(const String& pin, const String& value, unsigned long now) {
+    bool found = false;
+    DASHLY_TAKE(_qLock);
+    for (uint8_t i = 0; i < 32; i++) {
+      Seen& s = _seen[i];
+      if (!s.used) continue;
+      if ((now - s.at) >= SEEN_TTL_MS) {
+        s.used = false;
+        continue;
+      }
+      if (strcmp(s.pin, pin.c_str()) == 0 && strcmp(s.value, value.c_str()) == 0) {
+        s.used = false;
+        found = true;
+        break;
+      }
+    }
+    DASHLY_GIVE(_qLock);
+    return found;
+  }
+
+  // Command found only in the HTTP queue (the WebSocket missed it): deliver it.
+  void pushPolledCommand(const String& pin, const String& value) {
+    DASHLY_TAKE(_qLock);
+    _in.push(pin.c_str(), value.c_str(), false);
+    DASHLY_GIVE(_qLock);
+  }
+
+  // ---------- WebSocket side ----------
   void sendPhoenixHeartbeat() {
 #if DASHLY_HAS_REALTIME
     String out = String("{\"topic\":\"phoenix\",\"event\":\"heartbeat\",\"payload\":{},\"ref\":\"") +
                  String(_ref++) + "\"}";
     _ws.sendTXT(out);
-#endif
-  }
-
-  bool beginRealtime(const String& projectId, const String& sbUrl, const String& sbAnon) {
-    _projectId = projectId;
-    _sbUrl = sbUrl;
-    _sbAnon = sbAnon;
-    _topic = "project:" + _projectId;
-    _realtimeEnabled = false;
-#if !DASHLY_HAS_REALTIME
-    return false;
-#else
-    String host = _sbUrl;
-    host.replace("https://", "");
-    host.replace("http://", "");
-    int slash = host.indexOf("/");
-    if (slash > 0) host = host.substring(0, slash);
-    _wsHost = host;
-    _wsPath = "/realtime/v1/websocket?apikey=" + _sbAnon + "&vsn=1.0.0";
-
-    _ws.beginSSL(_wsHost.c_str(), 443, _wsPath.c_str());
-    _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) { this->handleWs(type, payload, length); });
-    _ws.enableHeartbeat(30000, 5000, 2);
-    _ws.setReconnectInterval(1000);
-    _realtimeEnabled = true;
-    return true;
 #endif
   }
 
@@ -331,16 +447,39 @@ private:
 #endif
   }
 
+  void wsStep() {
+#if DASHLY_HAS_REALTIME
+    if (!_bootstrapped || !_realtimeMode) return;
+    if (!_wsBegun) {
+      _ws.beginSSL(_wsHost.c_str(), 443, _wsPath.c_str());
+      _ws.onEvent([this](WStype_t type, uint8_t* payload, size_t length) { this->handleWs(type, payload, length); });
+      _ws.enableHeartbeat(15000, 3000, 2);
+      _ws.setReconnectInterval(1000);
+      _wsBegun = true;
+    }
+    _ws.loop();
+    unsigned long now = millis();
+    if (now - _lastHeartbeatMs >= 20000) {
+      _lastHeartbeatMs = now;
+      if (_wsConnected) sendPhoenixHeartbeat();
+    }
+#endif
+  }
+
   void handleWs(WStype_t type, uint8_t* payload, size_t length) {
 #if DASHLY_HAS_REALTIME
     (void)length;
     if (type == WStype_CONNECTED) {
       DASHLY_LOG(">>> WS connected");
+      _wsConnected = true;
+      _wsJoined = false;
       joinTopic();
       return;
     }
     if (type == WStype_DISCONNECTED || type == WStype_ERROR) {
-      DASHLY_LOG(">>> WS disconnected");
+      if (_wsConnected) DASHLY_LOG(">>> WS disconnected");
+      _wsConnected = false;
+      _wsJoined = false;
       return;
     }
     if (type != WStype_TEXT) return;
@@ -350,15 +489,15 @@ private:
     String event = doc["event"] | "";
 
     if (event == "phx_reply") {
+      String topic = doc["topic"] | "";
+      if (topic != _topic) return;  // ignore heartbeat replies
       String status = doc["payload"]["status"] | "";
       if (status.length() == 0) status = doc["payload"]["response"]["status"] | "";
-      if (status == "ok" && !_presenceOnlineSent) {
+      if (status == "ok" && !_wsJoined) {
+        _wsJoined = true;
         trackPresence();
-        unsigned long now = millis();
-        if (sendPresence(true)) {
-          _presenceOnlineSent = true;
-          _lastPresenceMs = now;
-        }
+        _needPresence = true;  // HTTP task sends presence
+        _pollNow = true;       // HTTP task re-syncs the command queue after (re)connect
       }
       return;
     }
@@ -372,7 +511,7 @@ private:
           pin = doc["payload"]["pin"] | "";
           value = doc["payload"]["value"] | "";
         }
-        dispatchPinUpdate(pin, value);
+        acceptWsCommand(pin, value);
       }
       return;
     }
@@ -382,12 +521,110 @@ private:
       String value = doc["payload"]["data"]["new"]["value"] | "";
       if (pin.length() == 0) pin = doc["payload"]["data"]["record"]["pin_label"] | "";
       if (value.length() == 0) value = doc["payload"]["data"]["record"]["value"] | "";
-      dispatchPinUpdate(pin, value);
+      acceptWsCommand(pin, value);
     }
 #else
     (void)type;
     (void)payload;
     (void)length;
+#endif
+  }
+
+  // ---------- HTTP side ----------
+  void httpStep() {
+    if (!isNetworkReady()) {
+      _presenceOnlineSent = false;
+      return;
+    }
+    unsigned long now = millis();
+
+    if (!_bootstrapped) {
+      if (_lastBootstrapTry != 0 && (now - _lastBootstrapTry) < 3000) return;
+      _lastBootstrapTry = now;
+      doBootstrap();
+      return;
+    }
+
+    // 1. Outgoing values (highest priority)
+    if (now >= _sendRetryAt) {
+      Msg m;
+      DASHLY_TAKE(_qLock);
+      bool have = _out.pop(m);
+      DASHLY_GIVE(_qLock);
+      if (have) {
+        if (!sendUpdate(m.pin, m.value)) {
+          DASHLY_TAKE(_qLock);
+          _out.push(m.pin, m.value, true);  // keep it, newer value for the same pin wins
+          DASHLY_GIVE(_qLock);
+          _sendRetryAt = now + 1000;
+        }
+        return;
+      }
+    }
+
+    // 2. Presence
+    bool presenceDue = !_presenceOnlineSent || _needPresence || (now - _lastPresenceMs >= _presenceIntervalMs);
+    if (presenceDue && now >= _presenceRetryAt) {
+      if (sendPresence(true)) {
+        _presenceOnlineSent = true;
+        _needPresence = false;
+        _lastPresenceMs = now;
+      } else {
+        _presenceRetryAt = now + 3000;
+      }
+      return;
+    }
+
+    // 3. Fallback pin polling (only when the Realtime transport is not in use)
+    if (!_realtimeMode) runHttpFallback();
+
+    // 4. Command-queue poll: safety net + re-sync after every WebSocket (re)connect
+    if (_commandPollEnabled && _presenceOnlineSent) {
+      unsigned long interval = _realtimeMode ? _commandPollIntervalMs
+                                             : (_commandPollIntervalMs < 1200 ? _commandPollIntervalMs : 1200);
+      bool fast = (_pollNow || !_syncDone) && _lastPollOk;  // re-sync / backlog drain: quick, but never a hot loop
+      bool due = (now - _lastCommandPollMs >= interval) || (fast && (now - _lastCommandPollMs >= 300));
+      if (due) {
+        _pollNow = false;
+        pollDeviceCommands(now);
+      }
+    }
+  }
+
+  void doBootstrap() {
+#if !DASHLY_HAS_HTTPS
+    return;
+#else
+    String body;
+    int code = doGet((normalizeBase(_baseUrl) + "/api/bootstrap").c_str(), body);
+    if (code != 200 || body.length() == 0) return;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, body) != DeserializationError::Ok) return;
+
+    String projectId = doc["project_id"] | "";
+    String sbUrl = doc["supabase_url"] | "";
+    String sbAnon = doc["supabase_anon_key"] | "";
+    _restoreOnReconnect = doc["restore_on_reconnect"] | false;
+    if (projectId.length() == 0 || sbUrl.length() == 0 || sbAnon.length() == 0) return;
+
+    _projectId = projectId;
+    _sbUrl = sbUrl;
+    _sbAnon = sbAnon;
+    _topic = "project:" + _projectId;
+
+    String host = _sbUrl;
+    host.replace("https://", "");
+    host.replace("http://", "");
+    int slash = host.indexOf("/");
+    if (slash > 0) host = host.substring(0, slash);
+    _wsHost = host;
+    _wsPath = "/realtime/v1/websocket?apikey=" + _sbAnon + "&vsn=1.0.0";
+
+    bool wantRealtime = (_transportMode == AUTO_TRANSPORT || _transportMode == REALTIME_TRANSPORT);
+    _realtimeMode = wantRealtime && (DASHLY_HAS_REALTIME == 1);
+    _bootstrapped = true;  // set last: the WebSocket task starts using the values above
+    DASHLY_LOG(">>> Dashly bootstrap OK");
 #endif
   }
 
@@ -413,37 +650,46 @@ private:
     }
     if (body != _lastFallbackValue) {
       _lastFallbackValue = body;
-      dispatchPinUpdate(_fallbackPin, body);
+      pushPolledCommand(_fallbackPin, body);
     }
   }
 
   /**
    * Poll pending dashboard/automation commands (GET /api/device/commands).
-   * Requires gateway >= 2026-05 with pending=1 and queue=0 support on /api/update.
+   *  - boot-time backlog: acknowledged and discarded (never executed)
+   *  - command already received over WebSocket: acknowledged only (no second execution)
+   *  - command the WebSocket missed: delivered to the sketch, then acknowledged
    */
   void pollDeviceCommands(unsigned long now) {
-    if (now - _lastCommandPollMs < _commandPollIntervalMs) return;
     _lastCommandPollMs = now;
 
     String body;
     String url = normalizeBase(_baseUrl) + "/api/device/commands?pending=1&limit=5";
     int code = doGet(url.c_str(), body);
+    _lastPollOk = (code == 200);
     if (code != 200 || body.length() == 0) return;
 
     JsonDocument doc;
     if (deserializeJson(doc, body) != DeserializationError::Ok) return;
     JsonArray arr = doc["commands"].as<JsonArray>();
-    if (arr.isNull() || arr.size() == 0) return;
+    if (arr.isNull() || arr.size() == 0) {
+      _syncDone = true;
+      return;
+    }
 
     for (JsonObject cmd : arr) {
       uint32_t id = cmd["id"] | 0;
       String pin = cmd["pin_label"] | "";
       String value = cmd["value"] | "";
-      if (id == 0 || pin.length() == 0) continue;
+      if (id == 0) continue;
       if (id > _lastCommandId) _lastCommandId = id;
-      dispatchPinUpdate(pin, value);
+      if (pin.length() > 0 && _syncDone) {
+        bool alreadyDelivered = consumeSeen(pin, value, millis());
+        if (!alreadyDelivered) pushPolledCommand(pin, value);
+      }
       ackDeviceCommand(id);
     }
+    if (!_syncDone) _pollNow = true;  // keep draining the boot-time backlog quickly
   }
 
   bool ackDeviceCommand(uint32_t id) {
@@ -451,6 +697,15 @@ private:
     String resp;
     String url = normalizeBase(_baseUrl) + "/api/device/ack";
     return httpRequest("POST", url.c_str(), payload.c_str(), resp) == 200;
+  }
+
+  bool sendUpdate(const char* pin, const char* value) {
+    if (!isNetworkReady()) return false;
+    String body;
+    // queue=0: device telemetry/status must not re-enter the dashboard command queue.
+    String url = normalizeBase(_baseUrl) + "/api/update?pin=" + urlEncode(String(pin)) + "&value=" +
+                 urlEncode(String(value)) + "&queue=0";
+    return doGet(url.c_str(), body) == 200;
   }
 
   bool sendPresence(bool online) {
@@ -462,6 +717,46 @@ private:
 
   int doGet(const char* fullUrl, String& outBody) { return httpRequest("GET", fullUrl, nullptr, outBody); }
 
+#if defined(ESP32)
+  // ESP32: one persistent TLS connection, reused by every request (no handshake per request).
+  int httpRequest(const char* method, const char* fullUrl, const char* payload, String& outBody) {
+    outBody = "";
+    DASHLY_TAKE(_httpLock);
+    int code = -1;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      if (!_secureInit) {
+        _secure.setInsecure();
+        _secureInit = true;
+      }
+      if (!_http.begin(_secure, String(fullUrl))) {
+        code = -1;
+        _secure.stop();
+        continue;
+      }
+      _http.setReuse(true);
+      _http.setTimeout(8000);
+      _http.addHeader("Authorization", String("Bearer ") + String(_token));
+      if (String(method) == "POST") {
+        _http.addHeader("Content-Type", "application/json");
+        code = _http.POST(payload ? payload : "{}");
+      } else {
+        code = _http.GET();
+      }
+      if (code > 0) outBody = _http.getString();
+      _http.end();
+      if (code > 0) {
+        _lastHttpCode = code;
+        DASHLY_GIVE(_httpLock);
+        return code;
+      }
+      _secure.stop();  // stale/broken connection: the next attempt reconnects
+    }
+    _lastHttpCode = code;
+    DASHLY_GIVE(_httpLock);
+    return code;
+  }
+#else
+  // ESP8266 / other: one connection per request (low memory use).
   int httpRequest(const char* method, const char* fullUrl, const char* payload, String& outBody) {
     outBody = "";
 #if !DASHLY_HAS_HTTPS
@@ -474,18 +769,11 @@ private:
     int code = -1;
     for (int attempt = 0; attempt < 2; ++attempt) {
       DashlySecureClient client;
-#if defined(ESP8266)
       client.setBufferSizes(512, 512);
-#endif
       client.setInsecure();
       HTTPClient http;
-      bool started = false;
-#if defined(ESP8266)
-      started = http.begin(client, String(fullUrl));
+      bool started = http.begin(client, String(fullUrl));
       http.useHTTP10(true);
-#else
-      started = http.begin(client, fullUrl);
-#endif
       if (!started) {
         _lastHttpCode = -1;
         code = -1;
@@ -506,14 +794,13 @@ private:
         _lastHttpCode = code;
         return code;
       }
-#if defined(ESP8266)
       delay(250);
-#endif
     }
     _lastHttpCode = code;
     return code;
 #endif
   }
+#endif
 
   String normalizeBase(const char* in) {
     String s = String(in ? in : DEFAULT_BASE_URL);
